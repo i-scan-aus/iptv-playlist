@@ -20,7 +20,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -31,21 +32,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Generate IPTV playlist
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffprobe -version
+
+      - name: Validate and generate playlist
         run: |
           python build_playlist.py
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: validation-report.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Prepare website
         run: |
           mkdir -p _site
           cp playlist.m3u _site/playlist.m3u
-          if [ -f index.html ]; then
-            cp index.html _site/index.html
-          else
-            echo '<h1>IPTV Playlist</h1><p><a href="playlist.m3u">Download M3U Playlist</a></p>' > _site/index.html
-          fi
+          cp validation-report.json _site/validation-report.json
+          echo '<h1>IPTV Playlist</h1><p><a href="playlist.m3u">Playlist</a></p><p><a href="validation-report.json">Validation report</a></p>' > _site/index.html
 
-      - name: Setup GitHub Pages
+      - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
@@ -53,5 +66,5 @@ jobs:
         with:
           path: _site
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy GitHub Pages
         uses: actions/deploy-pages@v4
