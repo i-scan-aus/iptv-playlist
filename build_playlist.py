@@ -1,6 +1,6 @@
+
 import concurrent.futures
 import json
-import os
 import re
 import subprocess
 import urllib.request
@@ -8,63 +8,117 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-BASE = "https://iptv-org.github.io/api/"
-OUTPUT = Path("playlist.m3u")
-REPORT = Path("validation-report.json")
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-COUNTRIES = {"AU": "Australia", "UK": "UK", "US": "USA"}
+BASE_URL = "https://iptv-org.github.io/api/"
+
+OUTPUT_FILE = Path("playlist.m3u")
+REPORT_FILE = Path("validation-report.json")
+
+COUNTRIES = {
+    "AU": "Australia",
+    "UK": "UK",
+    "US": "USA",
+}
+
+# UK and USA only. Australia skips validation.
 WORKERS = 10
 TIMEOUT = 12
 MAX_TESTS_PER_CHANNEL = 5
 
-BLOCKED_CATEGORIES = {"religious", "shopping"}
-BLOCKED_NAMES = re.compile(
-    r"\b(church|gospel|christian|islamic|quran|"
+EXCLUDED_CATEGORIES = {
+    "religious",
+    "shopping",
+}
+
+EXCLUDED_NAMES = re.compile(
+    r"\b("
+    r"church|gospel|christian|islamic|quran|"
     r"bible|worship|shopping|qvc|hsn|"
-    r"teleshopping|jewelry television)\b",
-    re.I,
+    r"teleshopping|jewelry television"
+    r")\b",
+    re.IGNORECASE,
 )
 
-# Known examples of UK-restricted live delivery networks.
-# This is a conservative filter, not a complete geo-block list.
-BLOCKED_HOSTS = (
+# Known UK-restricted BBC delivery hosts.
+# Applied to UK/USA only, not Australian channels.
+BLOCKED_HOSTS = {
     "vs-cmaf-pushb-uk-live.akamaized.net",
     "vs-hls-pushb-uk-live.akamaized.net",
     "vs-cmaf-pushb-uk.live.fastly.md.bbc.co.uk",
     "vs-hls-pushb-uk.live.fastly.md.bbc.co.uk",
-)
-
-CATEGORY_NAMES = {
-    "news": "News",
-    "sports": "Sports",
-    "movies": "Movies",
-    "documentary": "Documentaries",
-    "kids": "Kids",
-    "animation": "Kids",
-    "music": "Music",
-    "comedy": "Comedy",
-    "series": "TV Series",
-    "entertainment": "Entertainment",
-    "education": "Education",
-    "science": "Science",
-    "travel": "Travel",
-    "cooking": "Food & Cooking",
-    "business": "Business",
-    "weather": "Weather",
-    "lifestyle": "Lifestyle",
-    "family": "Family",
-    "general": "General",
 }
 
-PRIORITY = list(CATEGORY_NAMES)
+CATEGORY_NAMES = {
+    "animation": "Kids",
+    "auto": "Automotive",
+    "business": "Business",
+    "classic": "Classic TV",
+    "comedy": "Comedy",
+    "cooking": "Food & Cooking",
+    "culture": "Culture",
+    "documentary": "Documentaries",
+    "education": "Education",
+    "entertainment": "Entertainment",
+    "family": "Family",
+    "general": "General",
+    "kids": "Kids",
+    "legislative": "Government",
+    "lifestyle": "Lifestyle",
+    "movies": "Movies",
+    "music": "Music",
+    "news": "News",
+    "outdoor": "Outdoors",
+    "relax": "Relaxation",
+    "science": "Science",
+    "series": "TV Series",
+    "sports": "Sports",
+    "travel": "Travel",
+    "weather": "Weather",
+}
 
+CATEGORY_PRIORITY = [
+    "sports",
+    "news",
+    "movies",
+    "documentary",
+    "kids",
+    "animation",
+    "series",
+    "comedy",
+    "music",
+    "science",
+    "education",
+    "cooking",
+    "travel",
+    "business",
+    "weather",
+    "entertainment",
+    "family",
+    "lifestyle",
+    "general",
+]
 
-def download(name):
-    req = urllib.request.Request(
-        BASE + name + ".json",
-        headers={"User-Agent": "IPTVBuilder/3.0"},
+# ============================================================
+# HELPERS
+# ============================================================
+
+def download_json(name):
+    url = BASE_URL + name + ".json"
+    print(f"Downloading {url}", flush=True)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "IPTVPlaylistBuilder/4.0"
+        },
     )
-    with urllib.request.urlopen(req, timeout=120) as response:
+
+    with urllib.request.urlopen(
+        request, timeout=120
+    ) as response:
         return json.load(response)
 
 
@@ -78,18 +132,27 @@ def clean(value):
     )
 
 
-def category_for(channel):
+def get_category(channel):
     categories = channel.get("categories") or []
-    for category in PRIORITY:
+
+    for category in CATEGORY_PRIORITY:
         if category in categories:
+            return CATEGORY_NAMES.get(
+                category, category.title()
+            )
+
+    for category in categories:
+        if category in CATEGORY_NAMES:
             return CATEGORY_NAMES[category]
+
     return "General"
 
 
-def rank(stream):
+def stream_rank(stream):
     url = stream["url"].lower()
     score = 0
 
+    # Prefer HLS for IPTV player compatibility.
     if ".m3u8" in url:
         score += 100
     elif ".mpd" in url:
@@ -98,6 +161,7 @@ def rank(stream):
     if url.startswith("https://"):
         score += 10
 
+    # Prefer streams that don't need custom headers.
     if not stream.get("user_agent"):
         score += 5
 
@@ -105,38 +169,45 @@ def rank(stream):
         score += 5
 
     height = stream.get("height")
+
     if isinstance(height, (int, float)):
         score += min(height, 2160) / 100
 
     return score
 
 
-def probe(stream):
-    url = stream["url"]
+# ============================================================
+# STREAM VALIDATION
+# ============================================================
+
+def validate_stream(stream):
+    """Validate video playback using FFprobe."""
+
     command = [
         "ffprobe",
         "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name",
+        "-show_entries",
+        "stream=codec_type,codec_name",
         "-of", "json",
         "-analyzeduration", "3000000",
         "-probesize", "3000000",
     ]
 
-    headers = []
-
     if stream.get("user_agent"):
-        command += ["-user_agent", stream["user_agent"]]
-
-    if stream.get("referrer"):
-        headers.append("Referer: " + stream["referrer"])
-
-    if headers:
         command += [
-            "-headers",
-            "\r\n".join(headers) + "\r\n",
+            "-user_agent",
+            str(stream["user_agent"]),
         ]
 
-    command += [url]
+    if stream.get("referrer"):
+        command += [
+            "-headers",
+            "Referer: "
+            + str(stream["referrer"])
+            + "\r\n",
+        ]
+
+    command.append(stream["url"])
 
     try:
         result = subprocess.run(
@@ -151,13 +222,12 @@ def probe(stream):
             return False
 
         data = json.loads(result.stdout)
-        streams = data.get("streams") or []
 
-        # Require a recognisable video stream.
         return any(
-            s.get("codec_type") == "video"
-            and s.get("codec_name") not in (None, "unknown")
-            for s in streams
+            item.get("codec_type") == "video"
+            and item.get("codec_name")
+            not in (None, "unknown")
+            for item in data.get("streams", [])
         )
 
     except (
@@ -168,15 +238,22 @@ def probe(stream):
         return False
 
 
+# ============================================================
+# PLAYLIST ENTRY
+# ============================================================
+
 def make_entry(channel, stream, logo):
     name = clean(channel.get("name"))
-    cid = clean(channel["id"])
+    channel_id = clean(channel["id"])
+
     country = COUNTRIES[channel["country"]]
-    category = category_for(channel)
+    category = get_category(channel)
+
+    # CATEGORY FIRST, COUNTRY SECOND
     group = f"{category} | {country}"
 
     entry = (
-        f'#EXTINF:-1 tvg-id="{cid}" '
+        f'#EXTINF:-1 tvg-id="{channel_id}" '
         f'tvg-logo="{clean(logo)}" '
         f'group-title="{group}",{name}\n'
     )
@@ -184,120 +261,253 @@ def make_entry(channel, stream, logo):
     if stream.get("user_agent"):
         entry += (
             "#EXTVLCOPT:http-user-agent="
-            + clean(stream["user_agent"]) + "\n"
+            + clean(stream["user_agent"])
+            + "\n"
         )
 
     if stream.get("referrer"):
         entry += (
             "#EXTVLCOPT:http-referrer="
-            + clean(stream["referrer"]) + "\n"
+            + clean(stream["referrer"])
+            + "\n"
         )
 
     entry += stream["url"] + "\n"
+
     return group, name, entry
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    print("Downloading IPTV metadata...", flush=True)
-    channels_data = download("channels")
-    feeds = download("feeds")
-    streams = download("streams")
-    logos_data = download("logos")
+
+    print(
+        "Starting IPTV playlist generation...",
+        flush=True,
+    )
+
+    channels_data = download_json("channels")
+    feeds_data = download_json("feeds")
+    streams_data = download_json("streams")
+    logos_data = download_json("logos")
+
+    # --------------------------------------------------------
+    # FILTER CHANNELS
+    # --------------------------------------------------------
 
     channels = {}
 
     for channel in channels_data:
+
         if channel.get("country") not in COUNTRIES:
             continue
-        if channel.get("closed") or channel.get("is_nsfw"):
+
+        if channel.get("closed"):
             continue
-        if set(channel.get("categories") or []) & BLOCKED_CATEGORIES:
+
+        if channel.get("is_nsfw"):
             continue
-        if BLOCKED_NAMES.search(channel.get("name") or ""):
+
+        categories = set(
+            channel.get("categories") or []
+        )
+
+        if categories & EXCLUDED_CATEGORIES:
             continue
+
+        if EXCLUDED_NAMES.search(
+            channel.get("name") or ""
+        ):
+            continue
+
         channels[channel["id"]] = channel
+
+    print(
+        f"Eligible channels: {len(channels)}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # ENGLISH LANGUAGE FILTER
+    # --------------------------------------------------------
 
     english_feeds = set()
     english_channels = set()
 
-    for feed in feeds:
-        cid = feed.get("channel")
-        if cid in channels and "eng" in (feed.get("languages") or []):
-            english_feeds.add((cid, feed.get("id")))
-            english_channels.add(cid)
+    for feed in feeds_data:
+
+        channel_id = feed.get("channel")
+
+        if channel_id not in channels:
+            continue
+
+        languages = feed.get("languages") or []
+
+        if "eng" in languages:
+            english_feeds.add(
+                (channel_id, feed.get("id"))
+            )
+            english_channels.add(channel_id)
+
+    # --------------------------------------------------------
+    # CHANNEL LOGOS
+    # --------------------------------------------------------
 
     logos = {}
+
     for logo in logos_data:
-        cid = logo.get("channel")
-        if cid in channels and logo.get("url"):
-            if cid not in logos or logo.get("in_use"):
-                logos[cid] = logo["url"]
+
+        channel_id = logo.get("channel")
+
+        if channel_id not in channels:
+            continue
+
+        if not logo.get("url"):
+            continue
+
+        if (
+            channel_id not in logos
+            or logo.get("in_use")
+        ):
+            logos[channel_id] = logo["url"]
+
+    # --------------------------------------------------------
+    # COLLECT CANDIDATE STREAMS
+    # --------------------------------------------------------
 
     candidates = defaultdict(list)
     seen = set()
-    excluded_duplicates = 0
-    excluded_hosts = 0
 
-    for stream in streams:
-        cid = stream.get("channel")
+    duplicate_urls = 0
+    blocked_urls = 0
+
+    for stream in streams_data:
+
+        channel_id = stream.get("channel")
         url = (stream.get("url") or "").strip()
 
-        if cid not in channels or not url:
+        if channel_id not in channels:
+            continue
+
+        if not url:
             continue
 
         feed_id = stream.get("feed")
+
         if feed_id is not None:
-            if (cid, feed_id) not in english_feeds:
+
+            if (
+                channel_id,
+                feed_id,
+            ) not in english_feeds:
                 continue
-        elif cid not in english_channels:
+
+        elif channel_id not in english_channels:
             continue
 
-        if BLOCKED_NAMES.search(stream.get("title") or ""):
+        if EXCLUDED_NAMES.search(
+            stream.get("title") or ""
+        ):
             continue
 
-        hostname = (urlsplit(url).hostname or "").lower()
-        if hostname in BLOCKED_HOSTS:
-            excluded_hosts += 1
-            continue
+        country = channels[channel_id]["country"]
 
-        key = (cid, url)
+        # Do not block Australian streams.
+        if country != "AU":
+            hostname = (
+                urlsplit(url).hostname or ""
+            ).lower()
+
+            if hostname in BLOCKED_HOSTS:
+                blocked_urls += 1
+                continue
+
+        # Remove identical channel + URL combinations.
+        key = (channel_id, url)
+
         if key in seen:
-            excluded_duplicates += 1
+            duplicate_urls += 1
             continue
+
         seen.add(key)
 
         item = dict(stream)
         item["url"] = url
-        candidates[cid].append(item)
 
-    # Test streams concurrently, but never test unlimited
-    # alternatives for one channel.
-    tasks = []
-    for cid, options in candidates.items():
-        options.sort(key=rank, reverse=True)
-        for stream in options[:MAX_TESTS_PER_CHANNEL]:
-            tasks.append((cid, stream))
+        candidates[channel_id].append(item)
+
+    # --------------------------------------------------------
+    # AUSTRALIA: SKIP VALIDATION
+    # --------------------------------------------------------
+
+    australian_channels = {}
+
+    # UK/USA: VALIDATE
+    validation_tasks = []
+
+    for channel_id, options in candidates.items():
+
+        options.sort(
+            key=stream_rank,
+            reverse=True,
+        )
+
+        country = channels[channel_id]["country"]
+
+        if country == "AU":
+
+            # Keep one preferred URL per Australian channel.
+            australian_channels[channel_id] = options[0]
+
+        else:
+
+            for stream in options[
+                :MAX_TESTS_PER_CHANNEL
+            ]:
+                validation_tasks.append(
+                    (channel_id, stream)
+                )
 
     print(
-        f"Checking {len(tasks)} candidate streams "
-        f"for {len(candidates)} channels...",
+        f"Australian channels (no validation): "
+        f"{len(australian_channels)}",
         flush=True,
     )
 
+    print(
+        f"UK/USA streams to validate: "
+        f"{len(validation_tasks)}",
+        flush=True,
+    )
+
+    # --------------------------------------------------------
+    # RUN FFPROBE VALIDATION
+    # --------------------------------------------------------
+
     passed = defaultdict(list)
+
     tested = 0
     failed = 0
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=WORKERS
     ) as executor:
+
         futures = {
-            executor.submit(probe, stream): (cid, stream)
-            for cid, stream in tasks
+            executor.submit(
+                validate_stream, stream
+            ): (channel_id, stream)
+            for channel_id, stream in validation_tasks
         }
 
-        for future in concurrent.futures.as_completed(futures):
-            cid, stream = futures[future]
+        for future in concurrent.futures.as_completed(
+            futures
+        ):
+
+            channel_id, stream = futures[future]
+
             tested += 1
 
             try:
@@ -306,76 +516,142 @@ def main():
                 valid = False
 
             if valid:
-                passed[cid].append(stream)
+                passed[channel_id].append(stream)
             else:
                 failed += 1
 
             if tested % 100 == 0:
+
                 print(
-                    f"Checked {tested}/{len(tasks)} | "
-                    f"Passed {tested - failed} | Failed {failed}",
+                    f"Checked {tested}/"
+                    f"{len(validation_tasks)} | "
+                    f"Passed {tested - failed} | "
+                    f"Failed {failed}",
                     flush=True,
                 )
 
+    # --------------------------------------------------------
+    # GENERATE PLAYLIST
+    # --------------------------------------------------------
+
     grouped = defaultdict(list)
 
-    for cid, valid_streams in passed.items():
-        # Keep only the highest-ranked stream that passed.
-        best = max(valid_streams, key=rank)
-        group, name, entry = make_entry(
-            channels[cid],
-            best,
-            logos.get(cid, ""),
-        )
-        grouped[group].append((name.casefold(), entry))
+    # Add Australian channels without validation.
+    for channel_id, stream in australian_channels.items():
 
-    total = sum(len(entries) for entries in grouped.values())
+        group, name, entry = make_entry(
+            channels[channel_id],
+            stream,
+            logos.get(channel_id, ""),
+        )
+
+        grouped[group].append(
+            (name.casefold(), entry)
+        )
+
+    # Add validated UK/USA channels.
+    for channel_id, valid_streams in passed.items():
+
+        best_stream = max(
+            valid_streams,
+            key=stream_rank,
+        )
+
+        group, name, entry = make_entry(
+            channels[channel_id],
+            best_stream,
+            logos.get(channel_id, ""),
+        )
+
+        grouped[group].append(
+            (name.casefold(), entry)
+        )
+
+    total_channels = sum(
+        len(entries)
+        for entries in grouped.values()
+    )
+
+    # --------------------------------------------------------
+    # VALIDATION REPORT
+    # --------------------------------------------------------
 
     report = {
         "candidate_channels": len(candidates),
+        "australian_channels_unvalidated":
+            len(australian_channels),
         "tested_streams": tested,
         "passed_streams": tested - failed,
         "failed_streams": failed,
-        "published_channels": total,
-        "duplicate_urls_removed": excluded_duplicates,
-        "known_restricted_urls_excluded": excluded_hosts,
+        "published_channels": total_channels,
+        "duplicate_urls_removed": duplicate_urls,
+        "known_restricted_urls_excluded": blocked_urls,
         "groups": {
             group: len(entries)
-            for group, entries in sorted(grouped.items())
+            for group, entries in sorted(
+                grouped.items()
+            )
         },
     }
 
-    REPORT.write_text(
+    REPORT_FILE.write_text(
         json.dumps(report, indent=2),
         encoding="utf-8",
     )
 
-    print(json.dumps(report, indent=2), flush=True)
+    print(
+        json.dumps(report, indent=2),
+        flush=True,
+    )
 
-    if total == 0:
+    if total_channels == 0:
         raise RuntimeError(
-            "Validation produced no working channels. "
+            "No channels available. "
             "Refusing to publish an empty playlist."
         )
 
-    country_order = list(COUNTRIES.values())
+    # --------------------------------------------------------
+    # SORT BY CATEGORY FIRST
+    # --------------------------------------------------------
 
-    def group_key(group):
-        category, country = group.split(" | ", 1)
-        return (category.casefold(), country_order.index(country))
+    country_order = list(
+        COUNTRIES.values()
+    )
+
+    def group_sort(group):
+        category, country = group.split(
+            " | ", 1
+        )
+
+        return (
+            category.casefold(),
+            country_order.index(country),
+        )
 
     lines = ["#EXTM3U\n"]
 
-    for group in sorted(grouped, key=group_key):
-        for _, entry in sorted(grouped[group]):
+    for group in sorted(
+        grouped,
+        key=group_sort,
+    ):
+
+        for _, entry in sorted(
+            grouped[group]
+        ):
             lines.append(entry)
 
-    OUTPUT.write_text(
+    OUTPUT_FILE.write_text(
         "".join(lines),
         encoding="utf-8",
     )
 
-    print(f"Published {total} validated channels.")
+    print("--------------------------------")
+    print("Playlist generation complete!")
+    print(f"Australian channels: {len(australian_channels)}")
+    print(f"UK/USA validated: {len(passed)}")
+    print(f"Total published: {total_channels}")
+    print(f"Categories: {len(grouped)}")
+    print("--------------------------------")
 
 
 if __name__ == "__main__":
