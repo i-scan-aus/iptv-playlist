@@ -193,10 +193,10 @@ def build():
 
                             element.clear()
 
-                        # Free completed elements to avoid
-                        # retaining the entire source guide.
-                        if element is not source_root:
-                            continue
+                        # Release parsed channel/programme
+                        # elements from the source tree.
+                        if element.tag in ("channel", "programme"):
+                            source_root.clear()
 
                 sources_ok.append(country)
 
