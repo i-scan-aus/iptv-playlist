@@ -40,10 +40,9 @@ jobs:
           echo "Location:"
           curl -s https://ipinfo.io/json
 
-      - name: Install FFmpeg
+      - name: Verify FFprobe
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          command -v ffprobe
           ffprobe -version
 
       - name: Validate and generate playlist
