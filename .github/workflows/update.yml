@@ -32,6 +32,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Check runner location
+        run: |
+          echo "Public IP:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "Location:"
+          curl -s https://ipinfo.io/json
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
