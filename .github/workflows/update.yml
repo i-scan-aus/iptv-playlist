@@ -40,9 +40,11 @@ jobs:
           echo "Location:"
           curl -s https://ipinfo.io/json
 
-      - name: Verify FFprobe
+      - name: Ensure FFprobe is installed
         run: |
-          command -v ffprobe
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
           ffprobe -version
 
       - name: Validate and generate playlist
