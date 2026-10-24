@@ -1,5 +1,5 @@
 
-name: Update IPTV playlist
+name: Update IPTV playlist and EPG
 
 on:
   workflow_dispatch:
@@ -32,14 +32,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Check runner location
-        run: |
-          echo "Public IP:"
-          curl -s https://api.ipify.org
-          echo ""
-          echo "Location:"
-          curl -s https://ipinfo.io/json
-
       - name: Ensure FFprobe is installed
         run: |
           if ! command -v ffprobe >/dev/null 2>&1; then
@@ -51,12 +43,47 @@ jobs:
         run: |
           python build_playlist.py
 
-      - name: Upload validation report
+      - name: Generate XMLTV EPG
+        run: |
+          python build_epg.py
+
+      - name: Add EPG URL to playlist
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          playlist = Path("playlist.m3u")
+          content = playlist.read_text(encoding="utf-8-sig")
+
+          epg_url = (
+              "https://i-scan-aus.github.io/"
+              "iptv-playlist/epg.xml.gz"
+          )
+
+          lines = content.splitlines(keepends=True)
+
+          if not lines or not lines[0].startswith("#EXTM3U"):
+              raise RuntimeError("Invalid M3U playlist")
+
+          lines[0] = (
+              f'#EXTM3U url-tvg="{epg_url}" '
+              f'x-tvg-url="{epg_url}"\n'
+          )
+
+          playlist.write_text(
+              "".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: validation-report
-          path: validation-report.json
+          name: iptv-reports
+          path: |
+            validation-report.json
+            epg-report.json
           if-no-files-found: ignore
           retention-days: 14
 
@@ -64,8 +91,30 @@ jobs:
         run: |
           mkdir -p _site
           cp playlist.m3u _site/playlist.m3u
+          cp epg.xml _site/epg.xml
+          cp epg.xml.gz _site/epg.xml.gz
           cp validation-report.json _site/validation-report.json
-          echo '<h1>IPTV Playlist</h1><p><a href="playlist.m3u">Playlist</a></p><p><a href="validation-report.json">Validation report</a></p>' > _site/index.html
+          cp epg-report.json _site/epg-report.json
+
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>IPTV Playlist and EPG</title>
+          </head>
+          <body>
+            <h1>IPTV Playlist and EPG</h1>
+            <ul>
+              <li><a href="playlist.m3u">IPTV Playlist</a></li>
+              <li><a href="epg.xml.gz">Compressed EPG</a></li>
+              <li><a href="epg.xml">XMLTV EPG</a></li>
+              <li><a href="validation-report.json">Validation Report</a></li>
+              <li><a href="epg-report.json">EPG Report</a></li>
+            </ul>
+          </body>
+          </html>
+          HTML
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
