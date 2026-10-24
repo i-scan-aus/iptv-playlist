@@ -173,7 +173,7 @@ def make_entry(channel, stream, logo):
     cid = clean(channel["id"])
     country = COUNTRIES[channel["country"]]
     category = category_for(channel)
-    group = f"{country} | {category}"
+    group = f"{category} | {country}"
 
     entry = (
         f'#EXTINF:-1 tvg-id="{cid}" '
@@ -361,8 +361,8 @@ def main():
     country_order = list(COUNTRIES.values())
 
     def group_key(group):
-        country, category = group.split(" | ", 1)
-        return (country_order.index(country), category)
+        category, country = group.split(" | ", 1)
+        return (category.casefold(), country_order.index(country))
 
     lines = ["#EXTM3U\n"]
 
