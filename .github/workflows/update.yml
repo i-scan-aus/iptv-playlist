@@ -43,6 +43,18 @@ jobs:
         run: |
           python build_playlist.py
 
+      - name: Show playlist source summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("validation-report.json").read_text())
+          print("Accepted streams by source:")
+          for source, count in report.get("source_streams_accepted", {}).items():
+              print(f"- {source}: {count}")
+          PY
+
       - name: Generate XMLTV EPG
         run: |
           python build_epg.py
@@ -112,6 +124,9 @@ jobs:
               <li><a href="validation-report.json">Validation Report</a></li>
               <li><a href="epg-report.json">EPG Report</a></li>
             </ul>
+            <p>Australian channels are merged from IPTV-org, its Oceania feed,
+            Free-TV and Streamline IPTV. Subscription-only Foxtel and Kayo
+            channels are not included.</p>
           </body>
           </html>
           HTML
